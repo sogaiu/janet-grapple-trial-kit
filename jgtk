@@ -1,0 +1,131 @@
+#! /usr/bin/env janet
+
+(import ./common :as c)
+
+# XXX: adjust as requirements change
+(def [nvim-maj nvim-min] [0 10])
+
+(defn get-nvim-info
+  []
+  (def out-fname "nvim.txt")
+  (def cmd ["nvim"
+            "-es"
+            "-c" (string `redir! >` out-fname)
+            "-c" `echo stdpath("data")`
+            "-c" `echo stdpath("config")`
+            "-c" `echo "\n"`
+            "-c" `quit`])
+  (def results
+    (defer (when (os/stat out-fname)
+             (os/rm out-fname))
+      (try
+        (when (zero? (os/execute cmd :px))
+          (slurp out-fname))
+        ([e]
+          (eprintf "Failed to get nvim config info")))))
+  (when results
+    (peg/match ~(sequence (any (set "\r\n"))
+                          (some (sequence (not (choice "\r\n" "\n"))
+                                          # target
+                                          (capture (to (choice "\r\n" "\n")))
+                                          (choice "\r\n" "\n"))))
+               results)))
+
+(defn have-nvim?
+  []
+  (if (= :windows (os/which))
+    (when (not (c/ensure-win-bin "nvim.exe"))
+      (eprintf "Failed to find nvim.exe on PATH\n")
+      (break false))
+    (when (not (c/ensure-bin "nvim"))
+      (eprintf "Failed to find nvim on PATH\n")
+      (break false)))
+  (def ver-str
+    (c/get-version ["nvim" "--version"]
+                   ~(sequence "NVIM v"
+                              (capture (to (choice "\r\n" "\n" -1))))))
+  (when (not ver-str)
+    (eprintf "Failed to determine nvim version\n")
+    (break false))
+  #
+  ver-str)
+
+(defn parse-nvim-ver-str
+  [ver-str]
+  (peg/match ~(sequence (capture :d+)
+                        "."
+                        (capture :d+)
+                        "."
+                        (capture :d+)
+                        (capture (to -1)))
+             ver-str))
+
+(defn nvim-sufficient?
+  [ver-str]
+  (def result (parse-nvim-ver-str ver-str))
+  (when (not result)
+    (eprintf "Failed to parse nvim version string: %s" ver-str)
+    (break false))
+  (def [major minor _ _] result)
+  #
+  (and (= (scan-number major) nvim-maj)
+       (>= (scan-number minor) nvim-min)))
+
+# XXX: intent is to modify what neovim's stdpath returns
+#      see :h standard-path and :h base-directories
+(defn isolate
+  [root-dir]
+  (os/setenv "XDG_CONFIG_HOME" (string root-dir "/config"))
+  (os/setenv "XDG_DATA_HOME" (string root-dir "/data"))
+  #(os/setenv "XDG_RUNTIME_DIR" (string root-dir "/runtime"))
+  (os/setenv "XDG_STATE_HOME" (string root-dir "/state"))
+  (os/setenv "XDG_CACHE_HOME" (string root-dir "/cache"))
+  (os/setenv "XDG_LOG_FILE" (string root-dir "/log")))
+
+(defn setup
+  []
+  # verify nvim exists and its version is sufficient
+  (def nvim-ver-str (have-nvim?))
+  (when (not nvim-ver-str)
+    (os/exit 1))
+  (when (not (nvim-sufficient? nvim-ver-str))
+    (eprintf "nvim version is %s, need at least %d.%d.0"
+             nvim-ver-str nvim-maj nvim-min)
+    (os/exit 1))
+  # figure out where various files should live
+  (def nvim-info (get-nvim-info))
+  (when (not nvim-info)
+    (eprintf "Failed to determine nvim config and data locations")
+    (os/exit 1))
+  (def [nvim-data nvim-config] nvim-info)
+  # copy relevant files to appropriate locations
+  (os/mkdir nvim-data)
+  (os/mkdir (string nvim-data "/site"))
+  (os/mkdir (string nvim-data "/site/autoload"))
+  (spit (string nvim-data "/site/autoload/plug.vim")
+        (slurp "plug.vim"))
+  #
+  (os/mkdir nvim-config)
+  (spit (string nvim-config "/init.vim")
+        (slurp "init.vim"))
+  # install plugins
+  (print "Installing plugins...")
+  (def r (os/execute ["nvim"
+                      "-es"
+                      "-u" "install.vim"
+                      "-c" "PlugInstall"
+                      "-c" "quit"]
+                     :p))
+  (when (not (zero? r))
+    (eprintf "nvim exited with non-zero code: %d" r)
+    (os/exit 1))
+  #
+  true)
+
+(defn main
+  [& argv]
+  (def root-dir (os/cwd))
+  (isolate root-dir)
+  (setup)
+  (os/execute ["nvim" ;(array/slice argv 1)] :px))
+
